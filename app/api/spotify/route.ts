@@ -26,6 +26,7 @@ interface SpotifyTrack {
     id: string;
     name: string;
     release_date: string;
+    images: Array<{ url: string; height: number; width: number }>;
   };
   explicit?: boolean;
 }
@@ -42,7 +43,7 @@ interface SpotifyAlbumResponse {
 interface ProcessedTrack {
   id: string;
   name: string;
-  artists: { name: string }[];
+  artists: SpotifyArtist[];
   popularity: number;
   duration_ms: number;
   preview_url: string | null;
@@ -50,8 +51,47 @@ interface ProcessedTrack {
     id: string;
     name: string;
     release_date: string;
+    total_tracks: number;
+    images: Array<{ url: string; height: number; width: number }>;
   };
   explicit?: boolean;
+}
+
+interface SpotifyAlbum {
+  id: string;
+  name: string;
+  release_date: string;
+  total_tracks: number;
+  artists: SpotifyArtist[];
+}
+
+interface SpotifyArtistResponse {
+  id: string;
+  name: string;
+  genres: string[];
+  followers: { total: number };
+  images: Array<{ url: string; height: number; width: number }>;
+}
+
+interface SpotifyAlbumsResponse {
+  items: SpotifyAlbum[];
+  next: string | null;
+}
+
+interface SpotifyAlbumDetails {
+  id: string;
+  name: string;
+  artists: SpotifyArtist[];
+  release_date: string;
+  total_tracks: number;
+  images: Array<{ url: string; height: number; width: number }>;
+}
+
+interface SpotifySearchResponse {
+  tracks: {
+    items: SpotifyTrack[];
+    next: string | null;
+  };
 }
 
 async function getAccessToken(): Promise<string> {
@@ -82,21 +122,41 @@ async function getTrackDetails(trackId: string, accessToken: string): Promise<Pr
     },
   });
 
+  // Get full album details to get images
+  const albumResponse = response.data.album ? await axios.get<SpotifyAlbumDetails>(`${SPOTIFY_API_BASE}/albums/${response.data.album.id}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  }) : null;
+
   return {
     id: response.data.id,
     name: response.data.name,
     artists: response.data.artists.map((artist) => ({
       name: artist.name,
+      id: artist.id
     })),
     popularity: response.data.popularity,
     duration_ms: response.data.duration_ms,
     preview_url: response.data.preview_url,
-    album: response.data.album,
+    album: response.data.album ? {
+      id: response.data.album.id,
+      name: response.data.album.name,
+      release_date: response.data.album.release_date,
+      total_tracks: albumResponse?.data.total_tracks || 1,
+      images: albumResponse?.data.images || response.data.album.images || []
+    } : undefined,
     explicit: response.data.explicit,
   };
 }
 
 async function getAlbumTracks(albumId: string, accessToken: string): Promise<ProcessedTrack[]> {
+  const albumResponse = await axios.get<SpotifyAlbumDetails>(`${SPOTIFY_API_BASE}/albums/${albumId}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
   const response = await axios.get<SpotifyAlbumResponse>(`${SPOTIFY_API_BASE}/albums/${albumId}/tracks?limit=50`, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -119,16 +179,35 @@ async function getAlbumTracks(albumId: string, accessToken: string): Promise<Pro
 
   const tracks = await Promise.all(
     allTracks.map(async (track) => {
-      return getTrackDetails(track.id, accessToken);
+      const trackDetails = await getTrackDetails(track.id, accessToken);
+      return {
+        ...trackDetails,
+        album: trackDetails.album ? {
+          ...trackDetails.album,
+          images: albumResponse.data.images
+        } : undefined
+      };
     })
   );
 
   return tracks.sort((a, b) => b.popularity - a.popularity);
 }
 
+async function getArtistDetails(artistId: string, accessToken: string): Promise<SpotifyArtistResponse> {
+  const response = await axios.get<SpotifyArtistResponse>(
+    `${SPOTIFY_API_BASE}/artists/${artistId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    }
+  );
+  return response.data;
+}
+
 async function getArtistTopTracks(artistId: string, accessToken: string): Promise<ProcessedTrack[]> {
-  const response = await axios.get<{ tracks: SpotifyTrack[] }>(
-    `${SPOTIFY_API_BASE}/artists/${artistId}/top-tracks?market=US`,
+  const artistResponse = await axios.get<SpotifyArtistResponse>(
+    `${SPOTIFY_API_BASE}/artists/${artistId}`,
     {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -136,18 +215,51 @@ async function getArtistTopTracks(artistId: string, accessToken: string): Promis
     }
   );
 
-  return response.data.tracks.map((track) => ({
-    id: track.id,
-    name: track.name,
-    artists: track.artists.map((artist) => ({
-      name: artist.name,
-    })),
-    popularity: track.popularity,
-    duration_ms: track.duration_ms,
-    preview_url: track.preview_url,
-    album: track.album,
-    explicit: track.explicit,
-  }));
+  let primaryArtistTracks: SpotifyTrack[] = [];
+  let offset = 0;
+  let firstBatch = true;
+  
+  // Keep fetching until we have at least 100 tracks where the artist is primary
+  while (primaryArtistTracks.length < 100 && offset < 200) {
+    const limit = 50;  // Always fetch maximum allowed per request
+    const searchResponse = await axios.get<SpotifySearchResponse>(
+      `${SPOTIFY_API_BASE}/search?type=track&limit=${limit}&offset=${offset}&q=artist:"${encodeURIComponent(artistResponse.data.name)}"`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+
+    const newTracks = searchResponse.data.tracks.items;
+    if (newTracks.length === 0) break; // No more results
+
+    // Filter for primary artist tracks
+    const newPrimaryTracks = newTracks.filter(track => track.artists[0].id === artistId);
+    primaryArtistTracks = [...primaryArtistTracks, ...newPrimaryTracks];
+    
+    offset += limit;
+    firstBatch = false;
+  }
+
+  // Process and return the top 100 tracks
+  return primaryArtistTracks
+    .map(track => ({
+      id: track.id,
+      name: track.name,
+      artists: track.artists,
+      popularity: track.popularity,
+      duration_ms: track.duration_ms,
+      preview_url: track.preview_url,
+      album: track.album && {
+        id: track.album.id,
+        name: track.album.name,
+        release_date: track.album.release_date,
+        total_tracks: 1, // For search results, we don't have this info
+        images: track.album.images
+      },
+      explicit: track.explicit,
+    }))
+    .sort((a, b) => b.popularity - a.popularity)
+    .slice(0, 100);
 }
 
 export async function POST(request: Request) {
@@ -172,15 +284,35 @@ export async function POST(request: Request) {
     let result;
     if (artistMatch) {
       const artistId = artistMatch[1];
-      const topTracks = await getArtistTopTracks(artistId, accessToken);
-      result = { topTracks };
+      const [artist, topTracks] = await Promise.all([
+        getArtistDetails(artistId, accessToken),
+        getArtistTopTracks(artistId, accessToken)
+      ]);
+      result = { artist, topTracks };
     } else if (albumMatch) {
       const albumId = albumMatch[1];
+      const albumResponse = await axios.get<SpotifyAlbumDetails>(`${SPOTIFY_API_BASE}/albums/${albumId}`, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+      
       const albumTracks = await getAlbumTracks(albumId, accessToken);
-      result = { albumTracks };
+      result = { 
+        album: {
+          id: albumResponse.data.id,
+          name: albumResponse.data.name,
+          artists: albumResponse.data.artists,
+          release_date: albumResponse.data.release_date,
+          total_tracks: albumResponse.data.total_tracks,
+          images: albumResponse.data.images
+        },
+        albumTracks 
+      };
     } else if (trackMatch) {
       const trackId = trackMatch[1];
       const track = await getTrackDetails(trackId, accessToken);
+      
       if (!track.album) {
         return NextResponse.json(
           { error: 'Track album information not found' },
@@ -189,14 +321,30 @@ export async function POST(request: Request) {
       }
 
       const albumId = track.album.id;
-      const albumTracks = await getAlbumTracks(albumId, accessToken);
+      const artistId = track.artists[0].id;
+
+      if (!artistId) {
+        return NextResponse.json(
+          { error: 'Artist information not found' },
+          { status: 404 }
+        );
+      }
+
+      const [albumTracks, artistTopTracks] = await Promise.all([
+        getAlbumTracks(albumId, accessToken),
+        getArtistTopTracks(artistId, accessToken)
+      ]);
+
       const trackRank = albumTracks.findIndex((t) => t.id === trackId) + 1;
+      const artistTrackRank = artistTopTracks.findIndex((t) => t.id === trackId) + 1;
 
       result = {
         track,
         albumTracks,
         trackRank,
         totalTracks: albumTracks.length,
+        artistTopTracks: track.album.total_tracks === 1 ? artistTopTracks : undefined,
+        artistTrackRank: track.album.total_tracks === 1 ? artistTrackRank : undefined
       };
     } else {
       return NextResponse.json(
