@@ -36,6 +36,7 @@ interface SpotifyAlbumResponse {
     name: string;
     artists: SpotifyArtist[];
   }>;
+  next: string | null;
 }
 
 interface ProcessedTrack {
@@ -96,14 +97,28 @@ async function getTrackDetails(trackId: string, accessToken: string): Promise<Pr
 }
 
 async function getAlbumTracks(albumId: string, accessToken: string): Promise<ProcessedTrack[]> {
-  const response = await axios.get<SpotifyAlbumResponse>(`${SPOTIFY_API_BASE}/albums/${albumId}/tracks`, {
+  const response = await axios.get<SpotifyAlbumResponse>(`${SPOTIFY_API_BASE}/albums/${albumId}/tracks?limit=50`, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
     },
   });
 
+  // If there are more tracks, fetch them
+  let allTracks = response.data.items;
+  let offset = 50;
+  
+  while (response.data.next) {
+    const nextResponse = await axios.get<SpotifyAlbumResponse>(`${SPOTIFY_API_BASE}/albums/${albumId}/tracks?limit=50&offset=${offset}`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    allTracks = [...allTracks, ...nextResponse.data.items];
+    offset += 50;
+  }
+
   const tracks = await Promise.all(
-    response.data.items.map(async (track) => {
+    allTracks.map(async (track) => {
       return getTrackDetails(track.id, accessToken);
     })
   );
